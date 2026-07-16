@@ -92,6 +92,9 @@ Behavior:
 - Supports MLX quantization overrides on Apple Silicon via `--qwen3_tts_mlx_quantization bf16|4bit|6bit|8bit`.
 - Keeps the existing voice-clone/custom-voice/voice-design handler flow intact.
 - Defaults to the CustomVoice model with speaker `Aiden`, so no reference audio is required. Voice-clone/base models can still use `--qwen3_tts_ref_audio`.
+- The default `qwen3_tts_instruct` persona describes Aiden as a warm, direct American male voice and explicitly licenses natural paralanguage delivery (soft breaths, light pauses, and thinking-out-loud fillers like "hmm" or "uh" when they appear in the text), rendered as genuine thinking rather than hesitation. This lets the voice pipeline honor a longer, natural-sounding kickoff acknowledgment before `start_agent_run` without every reply sounding rushed or robotic.
+
+If you lower `--qwen3_tts_max_new_tokens` below ~768, the longer `start_agent_run` kickoff acknowledgment may truncate mid-utterance; the default of 2048 has ample headroom (supports 100+ seconds of audio) and should not be lowered without accounting for this.
 
 Install notes for Linux GGML:
 - The default PyPI `qwentts-cpp-python` wheel targets CUDA 12.8.

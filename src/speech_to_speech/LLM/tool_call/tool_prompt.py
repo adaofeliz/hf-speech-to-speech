@@ -38,7 +38,7 @@ To call a tool, put exactly one named-argument function call inside {{ enter_cod
 {{ enter_code }}function_name(required_arg='value'){{ end_code }}
 
 Rules:
-- You may say one brief natural sentence before the tool call; for slow information tools, briefly say that you will check.
+- You may say one brief natural sentence before the tool call; for slow information tools, briefly say that you will check. Exception: before calling `start_agent_run`, go long instead of brief - speak a longer natural acknowledgment (roughly 15 seconds) with real thinking-out-loud filler (hmm, uh, soft pauses), and do not resolve or wrap up since the task has not started. Only `start_agent_run` gets this exception; every other tool call stays brief per the rule above.
 - For expression/background tools, always speak first. For requested expressions, use a short pattern like "Sure, here's my best <emotion>."; otherwise use a fitting empathetic sentence.
 - Do not mention tags, functions, or tools. Keep prose outside tags brief, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.

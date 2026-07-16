@@ -51,8 +51,10 @@ class Qwen3TTSHandlerArguments:
         },
     )
     qwen3_tts_instruct: Optional[str] = field(
-        default=None,
-        metadata={"help": "Instruction text for VoiceDesign models (optional, required for voice design)."},
+        default="Aiden, a warm and direct American male voice, calm and attentive. Speak at a natural conversational pace with real, relaxed prosody: light pauses between phrases, soft breaths, and natural filler sounds like 'hmm' or 'uh' when the text includes them, rendered as genuine thinking-out-loud rather than hesitation or nervousness. Keep tone steady and unhurried; never sound rushed, robotic, or overly polished.",
+        metadata={
+            "help": "Style-control instruction string passed to the model. Defaults to a neutral, natural-sounding delivery. Required for VoiceDesign models; optional for CustomVoice and base models where it acts as a soft style hint."
+        },
     )
     qwen3_tts_xvec_only: bool = field(
         default=False,
@@ -87,9 +89,29 @@ class Qwen3TTSHandlerArguments:
         },
     )
     qwen3_tts_max_new_tokens: int = field(
-        default=1536,
+        default=2048,
         metadata={
-            "help": "Upper cap for Qwen3-TTS codec tokens. The handler estimates a per-utterance budget from the text and clamps it to this ceiling (~12 tokens per second of audio). Raise this above 1536 if you want to allow longer utterances."
+            "help": "Upper cap for Qwen3-TTS codec tokens. The handler estimates a per-utterance budget from the text and clamps it to this ceiling (~12 tokens per second of audio). Raise this above 2048 if you want to allow longer utterances."
+        },
+    )
+    qwen3_tts_gen_temperature: float = field(
+        default=0.7,
+        metadata={
+            "help": "Sampling temperature for Qwen3-TTS generation. Lower values are more deterministic; higher values are more diverse. Default is 0.7."
+        },
+    )
+    qwen3_tts_gen_top_p: float = field(
+        default=0.95,
+        metadata={"help": "Nucleus sampling probability mass for Qwen3-TTS generation. Default is 0.95."},
+    )
+    qwen3_tts_gen_top_k: int = field(
+        default=50,
+        metadata={"help": "Top-k sampling cutoff for Qwen3-TTS generation. Default is 50."},
+    )
+    qwen3_tts_gen_repetition_penalty: float = field(
+        default=1.05,
+        metadata={
+            "help": "Repetition penalty for Qwen3-TTS generation. Values above 1.0 discourage repeated tokens. Default is 1.05."
         },
     )
     qwen3_tts_blocksize: int = field(

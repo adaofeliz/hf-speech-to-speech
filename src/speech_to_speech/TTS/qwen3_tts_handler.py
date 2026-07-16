@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from sys import platform
 from threading import Event
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Iterator, Optional
 
 import numpy as np
@@ -51,6 +51,8 @@ ESTIMATED_QWEN3_WORDS_PER_SECOND = 2.6
 ESTIMATED_QWEN3_CHARS_PER_SECOND = 14.0
 QWEN3_TOKEN_SAFETY_MARGIN = 1.35
 QWEN3_BASE_PROMPT_SECONDS = 1.0
+_CHUNK_LOCK_MAX_RETRIES: int = 500
+_CHUNK_LOCK_RETRY_SLEEP: float = 0.02
 QWEN3_PUNCTUATION_PAUSE_SECONDS = 0.5
 QWEN3_LANGUAGE_ALIASES = {
     "zh": "chinese",
@@ -587,8 +589,36 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         sr = getattr(item, "sample_rate", None) or PIPELINE_SR
         return audio_chunk, sr
 
-    def _stream(self, gen: Any, label: str) -> Iterator[bytes | np.ndarray]:
-        """Common streaming loop: log TTFA and RTF, yield int16 chunks."""
+    def _acquire_and_pull_next_chunk(self, gen_iter: Iterator[Any]) -> Any:
+        """Acquire the MLX lock for one chunk pull, retrying on STT-priority pre-emption.
+
+        Acquires ``MLXLockContext`` around each individual ``next()`` call so the
+        lock is held only during the Metal/MLX work for that chunk, not across the
+        CPU-side resampling and chunking between chunks.  When STT priority is
+        active (todo 4), the effective timeout is capped at
+        ``STT_PRIORITY_NON_STT_TIMEOUT`` (0.05 s), so acquire returns ``False``
+        quickly.  In that case we sleep briefly and retry; after
+        ``_CHUNK_LOCK_MAX_RETRIES`` failed attempts we raise ``TimeoutError``.
+
+        ``StopIteration`` from ``next(gen_iter)`` is allowed to propagate so the
+        caller's ``while True`` loop can detect end-of-stream.
+        """
+        for _ in range(_CHUNK_LOCK_MAX_RETRIES):
+            with MLXLockContext(handler_name="Qwen3TTS-chunk", timeout=10.0) as acquired:
+                if acquired:
+                    return next(gen_iter)
+            sleep(_CHUNK_LOCK_RETRY_SLEEP)
+        raise TimeoutError(f"Qwen3TTS-chunk: failed to acquire MLX lock after {_CHUNK_LOCK_MAX_RETRIES} retries")
+
+    def _stream(self, gen: Any, label: str, use_mlx_lock: bool = False) -> Iterator[bytes | np.ndarray]:
+        """Common streaming loop: log TTFA and RTF, yield int16 chunks.
+
+        When ``use_mlx_lock=True`` each item is pulled via
+        ``_acquire_and_pull_next_chunk`` so the MLX lock is held only around the
+        individual ``next()`` call, not across the CPU-side resampling/chunking
+        work between chunks.  The default (``False``) preserves the original
+        ``for item in gen:`` behaviour unchanged for all non-MLX callers.
+        """
         cancel_gen = self.cancel_scope.generation if self.cancel_scope else None
         start = perf_counter()
         total_samples = 0
@@ -596,7 +626,21 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         found_speech = False
         leftover = np.array([], dtype=np.int16)
 
-        for item in gen:
+        if use_mlx_lock:
+            _gen_iter = iter(gen)
+
+            def _locked_items() -> Iterator[Any]:
+                while True:
+                    try:
+                        yield self._acquire_and_pull_next_chunk(_gen_iter)
+                    except StopIteration:
+                        return
+
+            items: Iterator[Any] = _locked_items()
+        else:
+            items = gen
+
+        for item in items:
             if cancel_gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(cancel_gen):
                 logger.info("TTS generation cancelled (interruption)")
                 return
@@ -769,16 +813,22 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         max_tokens: int,
         **generation_kwargs: Any,
     ) -> Iterator[bytes | np.ndarray]:
-        with MLXLockContext(handler_name="Qwen3TTS", timeout=10.0) as acquired:
+        """Stream MLX generation with narrowed lock scope.
+
+        The setup lock (``Qwen3TTS-setup``) covers only the generator-construction
+        call, so any eager MLX/Metal work in ``generation_fn(...)`` is protected.
+        The generator object itself is then iterated outside the setup lock, with
+        the per-chunk lock (``Qwen3TTS-chunk``) acquired for each individual
+        ``next()`` call via ``_stream(..., use_mlx_lock=True)``.
+        """
+        with MLXLockContext(handler_name="Qwen3TTS-setup", timeout=10.0) as acquired:
             if not acquired:
                 raise TimeoutError("Timed out waiting for MLX lock")
-            yield from self._stream(
-                generation_fn(
-                    **self._mlx_stream_kwargs(max_tokens=max_tokens),
-                    **generation_kwargs,
-                ),
-                label=label,
+            gen = generation_fn(
+                **self._mlx_stream_kwargs(max_tokens=max_tokens),
+                **generation_kwargs,
             )
+        yield from self._stream(gen, label=label, use_mlx_lock=True)
 
     def _process_voice_clone(self, text: str) -> Iterator[bytes | np.ndarray]:
         utterance_max_new_tokens = self._estimate_max_new_tokens(text)

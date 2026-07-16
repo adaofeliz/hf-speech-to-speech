@@ -10,8 +10,10 @@ import pytest
 
 import speech_to_speech.TTS.qwen3_tts_handler as qwen3_tts_module
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse, TTSInput
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.s2s_pipeline import rename_args
 from speech_to_speech.TTS.qwen3_tts_handler import Qwen3TTSHandler
 
 
@@ -873,3 +875,19 @@ def test_process_voice_clone_scales_max_tokens_for_mlx_backend(monkeypatch):
     assert len(outputs) == 1
     assert captured["max_tokens"] == handler._estimate_max_new_tokens(long_text)
     assert captured["max_tokens"] > 360
+
+
+def test_rename_args_routes_gen_fields_into_gen_kwargs_end_to_end():
+    """
+    End-to-end proof that rename_args(args, "qwen3_tts") picks up all four
+    qwen3_tts_gen_* fields and delivers them as gen_kwargs with the correct
+    default values — with zero handler-side wiring code.
+    """
+    args = Qwen3TTSHandlerArguments()
+    rename_args(args, "qwen3_tts")
+    assert args.__dict__["gen_kwargs"] == {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 50,
+        "repetition_penalty": 1.05,
+    }

@@ -7,8 +7,8 @@ from speech_to_speech.LLM.voice_prompt import VOICE_SYSTEM_PROMPT, build_voice_s
 def test_voice_prompt_is_short_and_keeps_persona_in_session_prompt():
     prompt = build_voice_system_prompt("Be concise.")
 
-    assert len(VOICE_SYSTEM_PROMPT.split()) < 230
-    assert len(prompt.split()) < 240
+    assert len(VOICE_SYSTEM_PROMPT.split()) < 280
+    assert len(prompt.split()) < 280
     assert "The session prompt defines persona" in prompt
     assert "Match the user's intent" not in prompt
 
@@ -29,12 +29,22 @@ def test_voice_prompt_requests_spoken_lead_in_and_sparing_expression_tools():
 
     assert "Before a tool call, use a brief natural utterance" in prompt
     assert "briefly say that you will check" in prompt
+    assert "Only `start_agent_run` gets this exception" in prompt
+    assert "go long instead of brief" in prompt
     assert "For expression/background tools, speak first." in prompt
     assert "Sure, here's my best <emotion>." in prompt
     assert "Sure, here's my best sadness." not in prompt
     assert "Never mention tools." in prompt
     assert "do not add a second spoken comment" in prompt
     assert "Use motion, dance, emotion, and similar tools sparingly" in prompt
+
+
+def test_voice_prompt_start_agent_run_exception_does_not_leak_to_other_tools():
+    prompt = build_voice_system_prompt("Be concise.")
+
+    # The exception is anchored to start_agent_run specifically, not any tool call.
+    assert "before calling `start_agent_run`" in prompt
+    assert "every other tool and every other reply" in prompt
 
 
 def test_local_tool_prompt_forbids_multiple_tool_calls():
@@ -66,6 +76,9 @@ def test_local_tool_prompt_allows_spoken_lead_in_before_code_block():
     )
 
     assert "one brief natural sentence before the tool call" in prompt
+    assert "before calling `start_agent_run`" in prompt
+    assert "go long instead of brief" in prompt
+    assert "Only `start_agent_run` gets this exception" in prompt
     assert "always speak first" in prompt
     assert "Sure, here's my best <emotion>." in prompt
     assert "Sure, here's my best sadness." not in prompt
