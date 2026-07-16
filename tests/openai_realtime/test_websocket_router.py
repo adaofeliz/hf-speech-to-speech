@@ -138,17 +138,14 @@ class TestConnection:
                 assert msg["event_id"].startswith("event_")
                 assert "session" in msg
 
-    def test_second_connection_rejected(self, setup):
+    def test_second_connection_evicts_lra(self, setup):
         app, *_ = setup
         with TestClient(app) as client:
             with client.websocket_connect("/v1/realtime") as ws1:
                 ws1.receive_json()  # session.created
                 with client.websocket_connect("/v1/realtime") as ws2:
                     msg = ws2.receive_json()
-                    assert msg["type"] == "error"
-                    # Rejection uses the stateless build_error_event helper —
-                    # the error type identifies pool exhaustion specifically.
-                    assert msg["error"]["type"] == "session_limit_reached"
+                    assert msg["type"] == "session.created"
 
 
 # ===================================================================
@@ -750,7 +747,7 @@ class TestPool:
             assert data["in_use"] == 0
             assert [u["session_id"] for u in data["units"]] == [None, None]
 
-    def test_two_clients_claim_two_slots_third_rejected(self):
+    def test_two_clients_claim_two_slots_third_evicts_lra(self):
         pool = [_make_unit(0), _make_unit(1)]
         app = create_app(pool=pool, stop_event=ThreadingEvent())
         with TestClient(app) as client:
@@ -760,9 +757,7 @@ class TestPool:
                     ws2.receive_json()  # session.created (different unit)
                     with client.websocket_connect("/v1/realtime") as ws3:
                         msg = ws3.receive_json()
-                        assert msg["type"] == "error"
-                        assert msg["error"]["type"] == "session_limit_reached"
-                    # Pool now reports 2 in_use
+                        assert msg["type"] == "session.created"
                     r = client.get("/v1/pool")
                     assert r.json()["in_use"] == 2
 

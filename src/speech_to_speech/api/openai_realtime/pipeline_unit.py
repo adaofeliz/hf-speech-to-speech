@@ -1,4 +1,5 @@
 import asyncio
+import time
 from queue import Queue
 from threading import Event
 from typing import Any, Optional
@@ -33,6 +34,10 @@ class SessionState(BaseModel):
     # `None` while the client is still active. Used by /v1/pool to surface stuck
     # units (handlers haven't finished propagating SESSION_END).
     released_at: Optional[float] = None
+    # Monotonic timestamp of the last client input (audio, text, response.create).
+    # Set to the connection time initially; updated on every inbound client event.
+    # Used for idle-timeout eviction and LRU eviction when the pool is full.
+    last_activity_at: float = Field(default_factory=time.monotonic)
 
 
 class PipelineUnit(BaseModel):

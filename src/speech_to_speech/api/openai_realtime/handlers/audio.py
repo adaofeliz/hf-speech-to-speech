@@ -139,14 +139,15 @@ class AudioHandler(RealtimeBaseHandler):
         """Handle VAD speech_stopped: record duration and emit stopped event."""
         if event.duration_s:
             self._state(conn_id).input_audio_duration_s = event.duration_s
-        return [
-            InputAudioBufferSpeechStoppedEvent(
-                type="input_audio_buffer.speech_stopped",
-                event_id=self._next_event_id(),
-                audio_end_ms=event.audio_end_ms,
-                item_id=self._input_item_id(conn_id),
-            )
-        ]
+        stopped_event = InputAudioBufferSpeechStoppedEvent(
+            type="input_audio_buffer.speech_stopped",
+            event_id=self._next_event_id(),
+            audio_end_ms=event.audio_end_ms,
+            item_id=self._input_item_id(conn_id),
+        )
+        if event.duration_s:
+            stopped_event.duration_s = round(event.duration_s, 3)  # type: ignore[attr-defined]  # allowed via model_config extra="allow"
+        return [stopped_event]
 
     # ── Outbound audio encoding ──────────────────
 

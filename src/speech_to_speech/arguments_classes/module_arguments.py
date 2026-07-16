@@ -67,6 +67,7 @@ class ModuleArguments:
             "help": "Number of isolated realtime pipelines in the pool. One uvicorn server listens on "
             "--ws_port and routes each incoming websocket to the next free pipeline (each has its own "
             "VAD/STT/LM/TTS handlers and conversation state). Max concurrent websocket sessions equals "
-            "num_pipelines; further connections are rejected. Only valid for --mode realtime. Default is 1."
+            "num_pipelines; when full, the least-recently-active session is evicted for new connections. "
+            "Only valid for --mode realtime. Default is 5."
         },
     )

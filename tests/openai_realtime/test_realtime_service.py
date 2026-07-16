@@ -260,6 +260,63 @@ class TestHandleSessionUpdate:
         assert runtime_config.session.instructions == "Be concise"
         assert runtime_config.session.audio.output.voice == "echo"  # preserved from first update
 
+    def test_chat_size_model_extra_sanity(self):
+        """Extra fields on RealtimeSessionCreateRequest land in model_extra, not silently lost.
+
+        This test is intentionally separate from the resize assertions so that a
+        schema-level surprise (SDK removes extra='allow', field becomes declared,
+        etc.) is caught here rather than producing a silently-passing no-op test.
+        """
+        from openai.types.realtime import SessionUpdateEvent as _SUE
+
+        raw = {"type": "session.update", "session": {"type": "realtime", "chat_size": 5}}
+        evt = _SUE.model_validate(raw)
+        assert evt.session.model_extra is not None, (
+            "RealtimeSessionCreateRequest no longer stores unknown fields in model_extra; "
+            "check SDK model_config['extra'] setting"
+        )
+        assert evt.session.model_extra.get("chat_size") == 5, (
+            "chat_size was not present in model_extra — schema may have changed"
+        )
+
+    def test_chat_size_resizes_chat(self, service, conn_id, runtime_config):
+        """session.update with chat_size=5 replaces the connection's Chat with Chat(5)."""
+        evt = SessionUpdateEvent.model_validate(
+            {"type": "session.update", "session": {"type": "realtime", "chat_size": 5}}
+        )
+        err = service.handle_session_update(conn_id, evt)
+        assert err is None
+        assert runtime_config.chat.size == 5
+
+    def test_chat_size_absent_keeps_default(self, service, conn_id, runtime_config):
+        """session.update without chat_size leaves the existing Chat unchanged."""
+        original_chat = runtime_config.chat
+        original_size = original_chat.size
+        service.handle_session_update(conn_id, self._make_update(instructions="hello"))
+        assert runtime_config.chat is original_chat
+        assert runtime_config.chat.size == original_size
+
+    def test_chat_size_zero_and_negative_ignored(self, service, conn_id, runtime_config):
+        """chat_size=0 and chat_size=-1 are silently ignored; no crash, no resize."""
+        original_chat = runtime_config.chat
+        for bad_value in (0, -1):
+            evt = SessionUpdateEvent.model_validate(
+                {"type": "session.update", "session": {"type": "realtime", "chat_size": bad_value}}
+            )
+            err = service.handle_session_update(conn_id, evt)
+            assert err is None
+            assert runtime_config.chat is original_chat
+
+    def test_chat_size_bool_ignored(self, service, conn_id, runtime_config):
+        """chat_size=True (bool, subclass of int) must not trigger a resize."""
+        original_chat = runtime_config.chat
+        evt = SessionUpdateEvent.model_validate(
+            {"type": "session.update", "session": {"type": "realtime", "chat_size": True}}
+        )
+        err = service.handle_session_update(conn_id, evt)
+        assert err is None
+        assert runtime_config.chat is original_chat
+
 
 # ===================================================================
 # Conversation item create
@@ -920,6 +977,26 @@ class TestDispatchPipelineEvent:
         assert len(events) == 1
         assert isinstance(events[0], InputAudioBufferSpeechStoppedEvent)
         assert service._state(conn_id).input_audio_duration_s == 0.0
+
+    def test_speech_stopped_passes_duration_when_truthy_and_omits_when_falsy(self, service, conn_id):
+        truthy_duration = 1.2345
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(duration_s=truthy_duration),
+        )
+        assert isinstance(events[0], InputAudioBufferSpeechStoppedEvent)
+        dumped = events[0].model_dump()
+        assert dumped["duration_s"] == round(truthy_duration, 3)
+
+        for falsy_kwargs in ({}, {"duration_s": 0}):
+            service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+            events = service.dispatch_pipeline_event(
+                conn_id,
+                SpeechStoppedEvent(**falsy_kwargs),
+            )
+            assert isinstance(events[0], InputAudioBufferSpeechStoppedEvent)
+            assert "duration_s" not in events[0].model_dump()
 
     # -- assistant_text --
 
@@ -2155,3 +2232,143 @@ class TestChatToolCallTracking:
 
         chat.append_tool_output("call_z", self._fco("call_z"))
         assert chat._has_call_id_in_buffer("call_z")
+
+    def test_reinjection_ordering_with_incomplete_assistant_pins_fix(self):
+        from openai.types.realtime.realtime_conversation_item_assistant_message import (
+            RealtimeConversationItemAssistantMessage,
+        )
+
+        chat = self._make_chat(size=1)
+        chat.add_item(self._user("turn 1"))
+        chat.add_item(self._fc("call_q"))
+        chat.add_item(self._user("turn 2"))
+        chat.trim_if_needed()
+        assert "call_q" in chat._pending_tool_calls
+
+        chat.add_item(self._assistant("I'm still thinking..."))
+        buf_len_before = len(chat.buffer)
+
+        fco = self._fco("call_q")
+        chat.add_item(fco)
+
+        assert len(chat.buffer) == buf_len_before + 2
+
+        fc_idx = next(i for i, e in enumerate(chat.buffer) if getattr(e, "type", None) == "function_call")
+        fco_idx = next(i for i, e in enumerate(chat.buffer) if getattr(e, "type", None) == "function_call_output")
+        asst_idx = next(i for i, e in enumerate(chat.buffer) if isinstance(e, RealtimeConversationItemAssistantMessage))
+
+        assert fc_idx + 1 == fco_idx, "fc and fco must be adjacent"
+        assert fco_idx < asst_idx, "re-injected pair must land before the trailing assistant message"
+        assert chat.buffer[fco_idx].output == '{"ok": true}', "fco output must survive byte-identically"
+
+    def test_reinjection_malformed_adjacency_gone_from_provider_payload(self):
+
+        chat = self._make_chat(size=1)
+        chat.add_item(self._user("turn 1"))
+        chat.add_item(self._fc("call_r"))
+        chat.add_item(self._user("turn 2"))
+        chat.trim_if_needed()
+        assert "call_r" in chat._pending_tool_calls
+
+        asst_partial = self._assistant("Thinking...")
+        chat.add_item(asst_partial)
+
+        chat.add_item(self._fco("call_r"))
+
+        payload = chat.to_responses_api_chat()
+
+        for i in range(len(payload) - 1):
+            current = payload[i]
+            nxt = payload[i + 1]
+            current_role = getattr(current, "role", None) or current.get("role", None)
+            nxt_type = getattr(nxt, "type", None) or nxt.get("type", None)
+            assert not (current_role == "assistant" and nxt_type == "function_call"), (
+                f"assistant message immediately before function_call at positions {i}/{i + 1}"
+            )
+
+    def test_trailing_incomplete_assistant_forced_completed_when_function_call_present(self):
+        """DeepSeek/OpenRouter rejects any payload where the LAST message is an
+        assistant with non-completed status while a function_call exists anywhere:
+        ``400 Bad Request: "Function call should not be used with prefix"``.
+        The outbound serialized payload must force that trailing status to
+        ``"completed"``, without mutating the underlying Chat buffer.
+        """
+        chat = self._make_chat(size=2)
+        chat.add_item(self._user("check my calendar"))
+        chat.add_item(self._fc("call_agent"))
+        chat.add_item(self._fco("call_agent"))
+
+        interrupted = self._assistant("Let me check")
+        interrupted.status = "incomplete"
+        chat.add_item(interrupted)
+
+        payload = chat.to_responses_api_chat()
+
+        assert any(p.get("type") == "function_call" for p in payload if isinstance(p, dict))
+        assert any(p.get("type") == "function_call_output" for p in payload if isinstance(p, dict))
+
+        last = payload[-1]
+        assert isinstance(last, dict)
+        assert last.get("type") == "message"
+        assert last.get("role") == "assistant"
+        assert last.get("status") == "completed"
+
+        buffer_asst = chat.buffer[-1]
+        assert buffer_asst is interrupted
+        assert interrupted.status == "incomplete", "chat buffer status must not be mutated"
+
+    def test_trailing_incomplete_assistant_preserved_when_no_function_call(self):
+        """Negative case: without any function_call in the payload, a trailing
+        incomplete assistant message keeps its original status. Forcing it
+        unconditionally would break legitimate prefix-completion use on
+        providers that support it (e.g. OpenAI's own models).
+        """
+        chat = self._make_chat(size=2)
+        chat.add_item(self._user("hello"))
+
+        interrupted = self._assistant("Sure, let me")
+        interrupted.status = "incomplete"
+        chat.add_item(interrupted)
+
+        payload = chat.to_responses_api_chat()
+
+        assert not any(
+            isinstance(p, dict) and p.get("type") in ("function_call", "function_call_output") for p in payload
+        )
+
+        last = payload[-1]
+        assert isinstance(last, dict)
+        assert last.get("role") == "assistant"
+        assert last.get("status") == "incomplete"
+
+    def test_completed_trailing_assistant_status_untouched(self):
+        """Sanity check: a normal completed trailing assistant status is not
+        modified (nothing to correct), regardless of function_call presence.
+        """
+        chat = self._make_chat(size=2)
+        chat.add_item(self._user("check my calendar"))
+        chat.add_item(self._fc("call_agent"))
+        chat.add_item(self._fco("call_agent"))
+        chat.add_item(self._assistant("Here you go."))
+
+        payload = chat.to_responses_api_chat()
+        last = payload[-1]
+        assert isinstance(last, dict)
+        assert last.get("status") == "completed"
+
+    def test_in_progress_trailing_assistant_forced_completed_when_function_call_present(self):
+        """Same correction path also applies to ``status == "in_progress"``."""
+        chat = self._make_chat(size=2)
+        chat.add_item(self._user("go"))
+        chat.add_item(self._fc("call_ip"))
+        chat.add_item(self._fco("call_ip"))
+
+        streaming = self._assistant("Working on it")
+        streaming.status = "in_progress"
+        chat.add_item(streaming)
+
+        payload = chat.to_responses_api_chat()
+        last = payload[-1]
+        assert isinstance(last, dict)
+        assert last.get("status") == "completed"
+        assert streaming.status == "in_progress"

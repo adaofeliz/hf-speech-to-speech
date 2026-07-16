@@ -280,7 +280,13 @@ class RealtimeService:
         return self.session.build_session_created(conn_id)
 
     def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> Optional[RealtimeErrorEvent]:
-        return self.session.handle_session_update(conn_id, event)
+        err = self.session.handle_session_update(conn_id, event)
+        if err is not None:
+            return err
+        raw_chat_size = (event.session.model_extra or {}).get("chat_size")
+        if isinstance(raw_chat_size, int) and not isinstance(raw_chat_size, bool) and raw_chat_size > 0:
+            self._state(conn_id).runtime_config.chat = Chat(raw_chat_size)
+        return None
 
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
         return self.audio.handle_audio_append(conn_id, event)

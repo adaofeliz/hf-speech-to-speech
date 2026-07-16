@@ -41,6 +41,9 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
+# Sessions with no client input for longer than this are closed by the idle
+# reaper. Configurable via the HERMES_SESSION_IDLE_TIMEOUT_S env var.
+SESSION_IDLE_TIMEOUT_S = float(__import__("os").environ.get("HERMES_SESSION_IDLE_TIMEOUT_S", "300"))
 QItem = TypeVar("QItem")
 
 
@@ -261,7 +264,13 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
         # One send loop per pipeline unit; each polls its own queues and forwards
         # to the websocket currently attached via unit.session.
         send_tasks = [asyncio.create_task(_send_loop_for(unit)) for unit in pool]
+        reaper_task = asyncio.create_task(_idle_reaper())
         yield
+        reaper_task.cancel()
+        try:
+            await reaper_task
+        except asyncio.CancelledError:
+            pass
         for task in send_tasks:
             task.cancel()
         for task in send_tasks:
@@ -280,16 +289,56 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
 
     def _claim_unit(ws: WebSocket) -> PipelineUnit | None:
-        """Atomically (between asyncio yield points) reserve the first idle unit.
-
-        Creates a placeholder SessionState that the caller fills in with the
-        session_id after RealtimeService.register().
-        """
         for unit in pool:
             if unit.session is None:
                 unit.session = SessionState(websocket=ws)
                 return unit
         return None
+
+    async def _evict_lra_and_claim(ws: WebSocket) -> PipelineUnit | None:
+        """Evict the least-recently-active session and immediately claim its unit.
+
+        Only considers active sessions (released_at is None). Draining units are
+        intentionally excluded — their pipeline is mid-teardown and not safe to
+        steal.  Returns None if every unit is already draining (very rare race).
+        """
+        candidates = [u for u in pool if u.session is not None and u.session.released_at is None]
+        if not candidates:
+            return None
+        victim = min(candidates, key=lambda u: u.session.last_activity_at)  # type: ignore[union-attr]
+        victim_session = victim.session
+        assert victim_session is not None
+        victim_id = victim_session.session_id
+        logger.warning(
+            f"Pool full — evicting pipeline {victim.index} (session {victim_id}, "
+            f"idle {time.monotonic() - victim_session.last_activity_at:.1f}s) for new client"
+        )
+        try:
+            await victim_session.websocket.close(1008, "Evicted: new client requested a slot")
+        except Exception:
+            pass
+        victim.session = SessionState(websocket=ws)
+        return victim
+
+    async def _idle_reaper() -> None:
+        """Close sessions that have had no client input for SESSION_IDLE_TIMEOUT_S."""
+        while True:
+            await asyncio.sleep(30)
+            now = time.monotonic()
+            for unit in pool:
+                sess = unit.session
+                if sess is None or sess.released_at is not None:
+                    continue
+                idle_s = now - sess.last_activity_at
+                if idle_s >= SESSION_IDLE_TIMEOUT_S:
+                    logger.info(
+                        f"Pipeline {unit.index}: closing idle session {sess.session_id} "
+                        f"({idle_s:.0f}s without client input)"
+                    )
+                    try:
+                        await sess.websocket.close(1001, "Session idle timeout")
+                    except Exception:
+                        pass
 
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:
@@ -297,21 +346,21 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
         unit = _claim_unit(ws)
         if unit is None:
-            logger.warning(f"Rejected connection: all {len(pool)} pipeline slots in use")
-            # Stateless error event — rejection is not chargeable to any unit's usage metrics.
+            unit = await _evict_lra_and_claim(ws)
+        if unit is None:
+            logger.warning(f"Rejected connection: all {len(pool)} pipeline slots are draining")
             await _send_event(
                 ws,
                 build_error_event(
-                    f"All {len(pool)} session slots are in use. Disconnect an existing client first.",
+                    f"All {len(pool)} session slots are draining. Retry in a moment.",
                     error_type="session_limit_reached",
                 ),
             )
-            await ws.close(code=1008, reason="All session slots are in use")
+            await ws.close(code=1008, reason="All session slots are draining")
             return
 
         pipeline_log_ctx.set(unit.index)
         session_id = unit.service.register()
-        # _claim_unit guarantees unit.session is not None for the returned unit.
         assert unit.session is not None
         unit.session.session_id = session_id
         logger.info(f"Client connected to pipeline {unit.index} (session {session_id})")
@@ -340,6 +389,8 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                     continue
 
                 if isinstance(event, InputAudioBufferAppendEvent):
+                    assert unit.session is not None
+                    unit.session.last_activity_at = time.monotonic()
                     chunks = unit.service.handle_audio_append(session_id, event)
                     rt_cfg = unit.service._state(session_id).runtime_config
                     for chunk in chunks:
@@ -356,11 +407,15 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         await _send_event(ws, err)
 
                 elif isinstance(event, ConversationItemCreateEvent):
+                    assert unit.session is not None
+                    unit.session.last_activity_at = time.monotonic()
                     events = unit.service.handle_conversation_item_create(session_id, event)
                     if events:
                         await _send_events(ws, events)
 
                 elif isinstance(event, ResponseCreateEvent):
+                    assert unit.session is not None
+                    unit.session.last_activity_at = time.monotonic()
                     result = unit.service.handle_response_create(session_id, event)
                     if result:
                         if result.type != "error":
@@ -428,7 +483,12 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
             if s is None:
                 return {"index": u.index, "state": "idle", "session_id": None}
             if s.released_at is None:
-                return {"index": u.index, "state": "active", "session_id": s.session_id}
+                return {
+                    "index": u.index,
+                    "state": "active",
+                    "session_id": s.session_id,
+                    "idle_for_s": round(now - s.last_activity_at, 2),
+                }
             # released by client but SESSION_END hasn't drained yet → unit
             # is still occupied; surface elapsed time so operators can spot
             # stuck handlers.

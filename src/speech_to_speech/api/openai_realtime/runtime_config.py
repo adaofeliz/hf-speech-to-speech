@@ -1,3 +1,5 @@
+import os
+
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
 from openai.types.realtime.realtime_audio_config_input import RealtimeAudioConfigInput
@@ -5,6 +7,8 @@ from openai.types.realtime.realtime_audio_config_output import RealtimeAudioConf
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from speech_to_speech.LLM.chat import Chat
+
+_DEFAULT_CHAT_HISTORY_SIZE = int(os.environ.get("S2S_CHAT_HISTORY_SIZE", "10"))
 
 
 def _apply_update(current: BaseModel, update: BaseModel) -> None:
@@ -37,7 +41,7 @@ class RuntimeConfig(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
 
-    chat: Chat = Field(default_factory=lambda: Chat(10))
+    chat: Chat = Field(default_factory=lambda: Chat(_DEFAULT_CHAT_HISTORY_SIZE))
     session: RealtimeSessionCreateRequest = Field(
         default_factory=lambda: RealtimeSessionCreateRequest(type="realtime"),
         validate_default=True,
