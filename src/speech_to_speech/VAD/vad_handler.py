@@ -18,6 +18,7 @@ from speech_to_speech.pipeline.handler_types import VADIn, VADOut
 from speech_to_speech.pipeline.messages import VADAudio
 from speech_to_speech.pipeline.queue_types import TextEventItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.utils.mlx_lock import clear_stt_priority, request_stt_priority
 from speech_to_speech.utils.utils import int2float
 from speech_to_speech.VAD.vad_iterator import VADIterator
 
@@ -56,6 +57,14 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
     to the following part.
     """
 
+    response_playing: Event | None = None
+    _base_thresh: float = 0.6
+    enable_noise_calibration: bool = False
+    _calibrate: bool = False
+    _calibration_deadline: float | None = None
+    _calibration_samples: list[float] | None = None
+    _calibration_window_s: float = 1.5
+
     def setup(
         self,
         should_listen: Event,
@@ -74,6 +83,9 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         speculative_reopen_ms: int = 1000,
         unanswered_reopen_ms: int = 7000,
         short_segment_merge_ms: int = 0,
+        response_playing: Event | None = None,
+        enable_noise_calibration: bool = False,
+        thresh_is_default: bool = True,
     ) -> None:
         self.should_listen = should_listen
         self.sample_rate = sample_rate
@@ -91,6 +103,13 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.speculative_reopen_ms = speculative_reopen_ms
         self.unanswered_reopen_ms = max(self.speculative_reopen_ms, unanswered_reopen_ms)
         self.short_segment_merge_ms = max(0, short_segment_merge_ms)
+        self.response_playing = response_playing
+        self._base_thresh: float = thresh
+        self.enable_noise_calibration = enable_noise_calibration
+        self._calibrate: bool = enable_noise_calibration and thresh_is_default
+        self._calibration_deadline: float | None = None
+        self._calibration_samples: list[float] = []
+        self._calibration_window_s: float = 1.5
         self._last_turn_detection: dict | None = None
         self.model, _ = torch.hub.load(
             "snakers4/silero-vad",
@@ -168,6 +187,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
 
         if "threshold" in td:
             self.iterator.threshold = td["threshold"]
+            self._base_thresh = td["threshold"]
             logger.info(f"VAD threshold updated to {td['threshold']}")
         if "silence_duration_ms" in td:
             self.iterator.min_silence_samples = self.sample_rate * td["silence_duration_ms"] / 1000
@@ -493,6 +513,10 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         runtime_config = None
         if isinstance(audio_chunk, tuple):
             audio_chunk, runtime_config = audio_chunk
+        if self.response_playing is not None:
+            target = min(0.95, self._base_thresh + 0.25) if self.response_playing.is_set() else self._base_thresh
+            if self.iterator.threshold != target:
+                self.iterator.threshold = target
         self._apply_runtime_turn_detection(runtime_config)
 
         if not self.should_listen.is_set():
@@ -503,6 +527,31 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
         self._total_samples += len(audio_int16)
         audio_float32 = int2float(audio_int16)
+
+        # Noise-floor auto-calibration: accumulate RMS during the startup window
+        # and set a calibrated VAD threshold once the window expires.  This is a
+        # one-shot measurement at startup only — it never re-runs mid-session.
+        if self._calibrate:
+            rms = float(np.sqrt(np.mean(audio_float32**2)))
+            if self._calibration_samples is None:
+                self._calibration_samples = []
+            self._calibration_samples.append(rms)
+            now_cal = time.time()
+            if self._calibration_deadline is None:
+                self._calibration_deadline = now_cal + self._calibration_window_s
+            if now_cal < self._calibration_deadline:
+                return
+            noise_floor = float(np.median(self._calibration_samples))
+            calibrated = min(0.9, max(0.4, 0.5 + noise_floor * 8))
+            self.iterator.threshold = calibrated
+            self._base_thresh = calibrated
+            self._calibrate = False
+            logger.info(
+                "VAD noise-floor calibration complete: noise_floor=%.4f → threshold=%.3f",
+                noise_floor,
+                calibrated,
+            )
+            # Fall through: let this chunk be processed normally.
 
         vad_output = self.iterator(torch.from_numpy(audio_float32))
 
@@ -523,6 +572,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             if effective_active_speech_duration_ms >= active_speech_min_ms:
                 turn_id, turn_revision, reopened = self._ensure_turn_for_speech_start(effective_start_ms)
                 self._speech_started_emitted = True
+                request_stt_priority("VAD-barge-in")
                 self._log_speech_starts += 1
                 logger.info(
                     "Speech started (confirmed, active=%.0fms, min=%.0fms, segment=%.0fms, turn=%s rev=%s)",
@@ -613,6 +663,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     )
                 if not self._speech_started_emitted:
                     self._cancel_pending_reopen()
+                clear_stt_priority("VAD-barge-in")
                 self._speech_started_emitted = False
                 self._discard_expired_pending_short_segment()
                 return
@@ -662,6 +713,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     )
                 if not self._speech_started_emitted:
                     self._cancel_pending_reopen()
+                clear_stt_priority("VAD-barge-in")
                 self._speech_started_emitted = False
             else:
                 if stitched_short_segment:
@@ -682,6 +734,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                                 interrupt_response=False,
                             )
                         )
+                    request_stt_priority("VAD-barge-in")
                 else:
                     turn_id, turn_revision = self._current_turn_metadata()
                 self._log_speech_ends += 1
@@ -721,6 +774,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     self.should_listen.clear()
                 yield VADAudio(audio=output_array, mode="final", turn_id=turn_id, turn_revision=turn_revision)
                 self.last_process_time = 0.0
+                clear_stt_priority("VAD-barge-in")
                 self._speech_started_emitted = False
 
     def _progressive_processing_pause(self, duration_ms: float) -> float:
@@ -743,6 +797,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                 logger.info("VAD: phantom trigger (empty buffer), closing speech pair")
                 if self._speech_started_emitted and self.text_output_queue:
                     self.text_output_queue.put(SpeechStoppedEvent(audio_end_ms=self._audio_ms))
+                clear_stt_priority("VAD-barge-in")
                 self._speech_started_emitted = False
                 self._discard_expired_pending_short_segment()
                 return
@@ -782,6 +837,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     )
                 if self._speech_started_emitted and self.text_output_queue:
                     self.text_output_queue.put(SpeechStoppedEvent(audio_end_ms=self._audio_ms))
+                clear_stt_priority("VAD-barge-in")
                 self._speech_started_emitted = False
             else:
                 if stitched_short_segment:
@@ -797,6 +853,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             interrupt_response=False,
                         )
                     )
+                    request_stt_priority("VAD-barge-in")
                 self._log_speech_ends += 1
                 self.should_listen.clear()
                 logger.info(f"Speech ended ({duration_ms:.0f}ms), stop listening")
@@ -805,6 +862,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                 if self.audio_enhancement:
                     array = self._apply_audio_enhancement(array)
                 yield VADAudio(audio=array)
+                clear_stt_priority("VAD-barge-in")
                 self._speech_started_emitted = False
 
     def _apply_audio_enhancement(self, array: np.ndarray) -> np.ndarray:
@@ -838,6 +896,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.last_process_time = 0.0
         self._total_samples = 0
         self._speech_started_emitted = False
+        clear_stt_priority("VAD-barge-in")
         self._turn_counter = 0
         self._current_turn_id = None
         self._current_turn_revision = None

@@ -62,6 +62,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+aec = [
+    "pywebrtc-audio>=0.1.0",
+]
 chattts = [
     "ChatTTS>=0.1.1",
 ]

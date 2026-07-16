@@ -502,6 +502,7 @@ def _build_realtime_pipeline_unit(
 
     vars(vad_kw)["text_output_queue"] = text_output_queue
     vars(vad_kw)["speculative_turns"] = speculative_turns
+    vars(vad_kw)["response_playing"] = response_playing
     for kw in (
         lm_kw,
         responses_api_kw,
