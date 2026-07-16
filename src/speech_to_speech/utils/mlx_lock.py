@@ -7,6 +7,7 @@ a global lock that all MLX handlers should acquire before using their models.
 """
 
 import logging
+import threading
 import types
 from threading import Lock, RLock, current_thread, get_ident
 from time import perf_counter
@@ -23,6 +24,28 @@ _lock_owner_thread: str | None = None
 _lock_owner_handler: str | None = None
 _lock_acquired_at: float | None = None
 _lock_depth = 0
+
+_stt_priority_requested = threading.Event()
+STT_PRIORITY_NON_STT_TIMEOUT: float = 0.05
+_STT_HANDLER_PREFIX: str = "Parakeet"
+
+
+def request_stt_priority(handler_name: str = "Unknown") -> None:
+    logger.debug("%s: STT priority requested", handler_name)
+    _stt_priority_requested.set()
+
+
+def clear_stt_priority(handler_name: str = "Unknown") -> None:
+    logger.debug("%s: STT priority cleared", handler_name)
+    _stt_priority_requested.clear()
+
+
+def _effective_timeout(timeout: float | None, handler_name: str) -> float | None:
+    if not _stt_priority_requested.is_set():
+        return timeout
+    if handler_name.startswith(_STT_HANDLER_PREFIX):
+        return timeout
+    return min(timeout if timeout is not None else STT_PRIORITY_NON_STT_TIMEOUT, STT_PRIORITY_NON_STT_TIMEOUT)
 
 
 def _owner_snapshot(now: float | None = None) -> str:
@@ -91,7 +114,8 @@ def acquire_mlx_lock(timeout: float | None = None, handler_name: str = "Unknown"
         owner_before = _owner_snapshot()
     logger.debug("%s: Attempting to acquire MLX lock (owner=%s)", handler_name, owner_before)
     start = perf_counter()
-    acquired = _mlx_lock.acquire(timeout=timeout) if timeout else _mlx_lock.acquire(blocking=True)
+    effective = _effective_timeout(timeout, handler_name)
+    acquired = _mlx_lock.acquire(timeout=effective) if effective else _mlx_lock.acquire(blocking=True)
     wait_s = perf_counter() - start
 
     if acquired:
