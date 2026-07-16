@@ -149,6 +149,21 @@ class Chat:
         with self._lock:
             self._append_tool_output_locked(call_id, output_item)
 
+    def _trailing_assistant_run_start(self) -> int:
+        """Return the index where the trailing contiguous run of assistant messages begins.
+
+        Scans backwards from the end of the buffer and returns the index of
+        the first item in the trailing contiguous run of
+        :class:`RealtimeConversationItemAssistantMessage` items.  If the last
+        item is not an assistant message (or the buffer is empty), returns
+        ``len(self.buffer)`` so that an insert at that index is equivalent to
+        an append.
+        """
+        idx = len(self.buffer)
+        while idx > 0 and isinstance(self.buffer[idx - 1], RealtimeConversationItemAssistantMessage):
+            idx -= 1
+        return idx
+
     def _append_tool_output_locked(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):
@@ -161,8 +176,9 @@ class Chat:
             logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
             fc = self._pending_tool_calls.pop(call_id)
             fc.status = "completed" if output_item.status is None else output_item.status
-            self.buffer.append(fc)
-            self.buffer.append(output_item)
+            insert_at = self._trailing_assistant_run_start()
+            self.buffer.insert(insert_at, fc)
+            self.buffer.insert(insert_at + 1, output_item)
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
@@ -364,6 +380,30 @@ class Chat:
                 if item.status is not None:
                     function_call_output["status"] = item.status
                 result.append(function_call_output)
+
+        # Provider-compatibility correction (DeepSeek via OpenRouter, and OpenAI
+        # Responses API semantics generally): when the payload contains any
+        # function_call / function_call_output AND the LAST item is an assistant
+        # message whose status is not ``"completed"`` (``"incomplete"`` /
+        # ``"in_progress"`` -- normal state after a barge-in / cancellation),
+        # the provider treats the request as using "prefix completion" and
+        # rejects it with ``400 Bad Request: "Function call should not be used
+        # with prefix"``. Force the outbound serialized status to ``"completed"``
+        # in that case; the underlying ``Chat`` buffer's assistant item status
+        # is intentionally not mutated.
+        if result and any(
+            isinstance(entry, dict) and entry.get("type") in ("function_call", "function_call_output")
+            for entry in result
+        ):
+            last = result[-1]
+            if (
+                isinstance(last, dict)
+                and last.get("type") == "message"
+                and last.get("role") == "assistant"
+                and last.get("status") not in (None, "completed")
+            ):
+                assistant_last: ResponseOutputMessageParam = last  # type: ignore[assignment]
+                assistant_last["status"] = "completed"
         return result
 
     def to_transformers_chat(self) -> list[dict[str, Any]]:

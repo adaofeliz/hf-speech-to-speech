@@ -10,10 +10,12 @@ Run with pytest, or standalone:  python tests/test_chat_completions_backend.py
 from __future__ import annotations
 
 import json
+import os as _os
 import queue
 import threading
 from types import SimpleNamespace
 
+import pytest as _pytest
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
     RealtimeConversationItemFunctionCallOutput,
@@ -576,6 +578,102 @@ def test_out_of_band_does_not_commit_to_default_conversation():
     assert "Background note." in text
     # Default conversation keeps only the seeded user turn — no assistant commit.
     assert not any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
+
+
+# ── Compaction generate fn ────────────────────────────────────────────────────
+
+
+def test_compaction_generate_fn_does_not_forward_extra_body():
+    """_build_compaction_generate_fn must NOT pass extra_body to the API.
+
+    Regression: the fn previously forwarded self._extra_body (e.g.
+    {"chat_template_kwargs": {"enable_thinking": False}}) to the compaction
+    call.  Some providers (e.g. OpenRouter) respond to that with a raw string
+    instead of a ChatCompletion object, causing:
+        AttributeError: 'str' object has no attribute 'choices'
+    """
+    h = _make_handler(stream=True)
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _FakeStream([_chunk(content="summary")])
+
+    h.client.chat.completions.create = fake_create
+    generate = h._build_compaction_generate_fn()
+    result = generate("sys", "user")
+
+    assert result == "summary"
+    assert "extra_body" not in captured, (
+        "extra_body must not be forwarded to the compaction call — "
+        "some providers return a str instead of a ChatCompletion when they receive it"
+    )
+    assert captured.get("stream") is True, "compaction call must use stream=True"
+
+
+def test_compaction_generate_fn_handles_empty_choices():
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream([_chunk()])
+
+    generate = h._build_compaction_generate_fn()
+    assert generate("sys", "user") == ""
+
+
+def test_compaction_generate_fn_handles_none_content():
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream(
+        [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))], usage=None)]
+    )
+
+    generate = h._build_compaction_generate_fn()
+    assert generate("sys", "user") == ""
+
+
+# ── Live compaction integration (requires manifest env vars) ──────────────────
+
+_LIVE_VARS = ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")
+_live_configured = all(_os.environ.get(v) for v in _LIVE_VARS)
+
+
+@_pytest.mark.skipif(not _live_configured, reason="LLM_BASE_URL / LLM_API_KEY / LLM_MODEL not set")
+def test_compaction_generate_fn_live():
+    """End-to-end: _build_compaction_generate_fn returns a non-empty string
+    from the real provider without raising AttributeError.
+
+    Set env vars to run:
+        LLM_BACKEND=chat-completions
+        LLM_BASE_URL=http://192.168.15.10:2099/v1
+        LLM_API_KEY=mnfst_...
+        LLM_MODEL=auto
+    """
+    base_url = _os.environ["LLM_BASE_URL"]
+    api_key = _os.environ["LLM_API_KEY"]
+    model = _os.environ["LLM_MODEL"]
+
+    orig_openai = base_mod.OpenAI
+    base_mod.OpenAI = orig_openai
+    h = ChatCompletionsApiModelHandler(
+        threading.Event(),
+        queue.Queue(),
+        queue.Queue(),
+        setup_kwargs=dict(
+            model_name=model,
+            base_url=base_url,
+            api_key=api_key,
+            stream=False,
+            disable_thinking=True,
+            compact_history=False,
+        ),
+    )
+
+    generate = h._build_compaction_generate_fn()
+    result = generate(
+        "You are a summarizer. Respond with a single short sentence.",
+        "The user asked about the weather and then asked to set a timer for 5 minutes.",
+    )
+
+    assert isinstance(result, str), f"expected str, got {type(result)!r}: {result!r}"
+    assert len(result) > 0, "expected non-empty summary from live provider"
 
 
 # ── Standalone runner (no pytest required) ────────────────────────────────────

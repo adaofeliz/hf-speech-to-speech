@@ -108,23 +108,25 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         logger.info(f"{self.__class__.__name__}:  warmed up! time: {(end - start):.3f} s")
 
     def _build_compaction_generate_fn(self) -> CompactGenerateFn:
-        """Return a generate fn that calls Chat Completions for compaction."""
         client = self.client
         model_name = self.model_name
         timeout = self.request_timeout
-        extra_body = self._extra_body
 
         def generate(system: str, user: str) -> str:
-            response = client.chat.completions.create(
+            stream = client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                extra_body=extra_body,
+                stream=True,
                 timeout=timeout,
             )
-            return response.choices[0].message.content or ""
+            result = ""
+            for chunk in stream:
+                if chunk.choices:
+                    result += chunk.choices[0].delta.content or ""
+            return result
 
         return generate
 
