@@ -7,6 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/speech-to-speech)](https://pypi.org/project/speech-to-speech/)
 [![Python](https://img.shields.io/pypi/pyversions/speech-to-speech)](https://pypi.org/project/speech-to-speech/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](./LICENSE)
+[![GitHub Trending: #1 Repository of the Day](https://img.shields.io/badge/GitHub%20Trending-%231%20Repository%20of%20the%20Day-7B2CBF?logo=github&logoColor=white)](https://trendshift.io/repositories/20645)
 
 </div>
 
@@ -175,9 +176,9 @@ Select implementations with `--stt`, `--llm_backend`, and `--tts`. Run `speech-t
 
 | Mode | Transport | Use it when |
 |---|---|---|
-| `realtime` (default) | WebSocket, OpenAI Realtime protocol at `/v1/realtime` | You are building an app or device against a standard voice API. |
+| `realtime` (default) | OpenAI Realtime protocol over WebSocket or WebRTC | You are building an app or device against a standard voice API. |
 | `local` | Your machine's microphone and speakers | You want to talk to the pipeline directly, no client needed. |
-| `websocket` | Raw PCM over WebSocket | You want a minimal custom client without the Realtime protocol. |
+| `raw-websocket` | Raw PCM over WebSocket | You want a minimal custom client without the Realtime protocol. |
 | `socket` | Raw PCM over TCP | Models run on a remote server, with a simple microphone/playback client. |
 
 ### Realtime Server
@@ -243,12 +244,12 @@ python scripts/benchmark_tts.py \
     --qwen3_mlx_quantizations bf16 4bit 6bit 8bit
 ```
 
-### WebSocket
+### Raw WebSocket
 
-1. Run the pipeline in WebSocket mode:
+1. Run the pipeline in raw WebSocket mode:
 
    ```bash
-   speech-to-speech --mode websocket --ws_host 0.0.0.0 --ws_port 8765
+   speech-to-speech --mode raw-websocket --ws_host 0.0.0.0 --ws_port 8765
    ```
 
 2. Connect from your client at `ws://<server-ip>:8765`. Send raw audio bytes as 16 kHz, int16, mono PCM and receive generated audio bytes back.
@@ -281,7 +282,7 @@ The compose file starts a llama.cpp server with Gemma 4, starts the TCP socket s
 
 ## Realtime API
 
-Realtime mode streams audio over a WebSocket using the OpenAI Realtime protocol, with live transcription and low-latency turn-taking. The server exposes `/v1/realtime`, and any OpenAI Realtime-compatible client can connect:
+Realtime mode supports the OpenAI Realtime protocol over WebSocket and WebRTC, with live transcription and low-latency turn-taking. WebSocket clients connect at `/v1/realtime`:
 
 ```python
 from openai import OpenAI
@@ -317,6 +318,27 @@ with client.realtime.connect(model="local") as conn:
 
 The server implements the core Realtime event set: `input_audio_buffer.append`, `session.update`, `conversation.item.create`, `response.create`, and `response.cancel` inbound; speech start/stop, streaming transcription, audio deltas, tool calls, and `response.done` outbound. The full event reference, architecture, and design details live in the [Realtime Engine README](./src/speech_to_speech/api/openai_realtime/README.md).
 
+### LLM Proxy
+
+With `--enable_llm_proxy`, the realtime server also exposes the remote LLM it is configured with as a plain OpenAI compatible endpoint, so a client can run side tasks (summaries, titles, background agents) with tools and streaming, fully concurrent with the voice conversation and never interrupted by new speech:
+
+* `POST /v1/chat/completions` when running `--llm_backend chat-completions`
+* `POST /v1/responses` when running `--llm_backend responses-api`
+
+The server performs no authentication and no throttling of its own. Enable the proxy only on a trusted network, or deploy the server behind a gateway that owns access control. The s2s-endpoint compute replica is such a gateway: it opens these paths only to clients that created their session with an HF token, checks the API key against that token, and applies a rate limit per user. Point the stock OpenAI SDK at whichever host you talk to; this server ignores the API key (a gateway in front decides what it must be):
+
+```python
+from openai import OpenAI
+
+llm = OpenAI(base_url="http://localhost:8765/v1", api_key="unused")
+completion = llm.chat.completions.create(
+    model="anything",  # ignored: the server forces its configured --model_name
+    messages=[{"role": "user", "content": "Summarize the conversation so far: ..."}],
+)
+```
+
+Requests are stateless (send the full message list each time) and are proxied to the configured upstream with the key held by the server, which never reaches clients. The `model` field is always overwritten with the server configured `--model_name`. The proxy is off by default, requires a remote backend (`chat-completions` or `responses-api`), and answers 501 with the reason otherwise.
+
 ## LLM Backends
 
 The LLM is the most compute-intensive and highest-latency component in the pipeline. A single forward pass through a large model can dominate end-to-end response time, so choosing the right backend for your hardware and latency budget matters. The pipeline supports:
@@ -329,6 +351,36 @@ Two API backends are available, sharing the same `--responses_api_*` connection 
 
 - `--llm_backend responses-api` (default) targets `/v1/responses`.
 - `--llm_backend chat-completions` targets `/v1/chat/completions`.
+
+### Direct Audio Input (No STT)
+
+Use `--stt none --llm_backend chat-completions` to send each completed VAD
+audio segment directly to an audio-input model. Direct audio mode is not
+supported with `--llm_backend responses-api`: a model may accept audio through
+`/v1/chat/completions` without supporting `/v1/responses`, including OpenAI's
+[`gpt-audio-1.5`](https://developers.openai.com/api/docs/models/gpt-audio-1.5).
+
+You must explicitly set `--model_name` to a model that accepts audio: the
+default `gpt-5.4-mini` accepts text and image input, but not audio. Check the
+provider's model documentation and endpoint support before enabling this mode.
+For OpenAI, see the
+[GPT-5.4 mini model card](https://developers.openai.com/api/docs/models/gpt-5.4-mini)
+and [audio-input guide](https://developers.openai.com/api/docs/guides/audio#add-audio-to-your-existing-application).
+
+```bash
+speech-to-speech \
+    --mode realtime \
+    --stt none \
+    --llm_backend chat-completions \
+    --model_name "YOUR_AUDIO_CAPABLE_MODEL" \
+    --responses_api_base_url "https://provider.example/v1" \
+    --responses_api_api_key "$PROVIDER_API_KEY"
+```
+
+OpenAI-compatible servers represent input audio differently. Use
+`--responses_api_audio_content_type input_audio` (the default) for embedded
+WAV base64, or `--responses_api_audio_content_type audio_url` for a base64
+data URL.
 
 The examples below pair Parakeet TDT for local STT and Qwen3-TTS for local TTS with different LLM backends.
 
@@ -426,6 +478,8 @@ speech-to-speech \
 
 Run the LLM in a separate llama.cpp process for the lowest-friction fully local setup, as shown in the [Reachy Mini local conversation guide](https://huggingface.co/blog/local-reachy-mini-conversation):
 
+For a fully local native-audio setup with the browser demo, Realtime turn revisions, and barge-in, see the tested [Gemma 4 12B speech-to-speech example for Apple Silicon](./examples/gemma4-12b-macos/README.md).
+
 ```bash
 # Terminal 1: llama.cpp serving Gemma 4
 llama-server -hf ggml-org/gemma-4-E4B-it-GGUF -np 2 -c 65536 -fa on --swa-full
@@ -511,7 +565,7 @@ References for all CLI arguments live in the [arguments classes](./src/speech_to
 See [ModuleArguments](./src/speech_to_speech/arguments_classes/module_arguments.py). It allows setting:
 
 - a common `--device`, if every part should run on the same device
-- `--mode`: `realtime` (default), `local`, `socket`, or `websocket`
+- `--mode`: `realtime` (default), `local`, `socket`, or `raw-websocket`
 - STT implementation (`--stt`)
 - LLM backend (`--llm_backend`: `transformers`, `mlx-lm`, `responses-api`, or `chat-completions`)
 - TTS implementation (`--tts`)
@@ -527,7 +581,33 @@ See [VADHandlerArguments](./src/speech_to_speech/arguments_classes/vad_arguments
 - `--min_speech_continuation_ms`: sustain-bar hysteresis threshold for speech that continues a reopenable soft-ended, uncommitted turn within the reopen window. The default and recommended pairing is `--min_speech_ms 384 --min_speech_continuation_ms 192`.
 - `--min_silence_ms`: minimum length of silence intervals for segmenting speech. Default is 64 ms.
 - `--short_segment_merge_ms`: optional merge window for stitching adjacent VAD segments that are each shorter than `--min_speech_ms`.
-- `--unanswered_reopen_ms`: sanity cap on how long a soft-ended speculative turn that has not yet received any assistant output stays reopenable.
+- `--speculative_reopen_ms`: delay response commitment for 800 ms after a soft-ended turn so immediately resumed speech can reopen it.
+- `--unanswered_reopen_ms`: sanity cap on how long a soft-ended speculative turn that has not yet received any assistant output stays reopenable. With Smart Turn enabled, this is clamped to at least `--smart_turn_max_wait_ms` so a turn remains reopenable for its full grace.
+
+### Smart Turn endpointing
+
+[Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3) can validate Silero's end-of-speech
+decisions using the content and prosody of the current turn. In realtime mode, Silero still finalizes the segment
+and STT/LLM work may begin speculatively. Complete turns start processing immediately and use
+`--speculative_reopen_ms` (800 ms by default) before committing output. Incomplete turns wait
+`--smart_turn_incomplete_delay_ms` (600 ms by default) before starting STT/LLM work, while their output remains
+gated by `--smart_turn_max_wait_ms` (2 seconds by default). If speech resumes during either delay, the existing turn is
+reopened as a newer revision, the accumulated audio is re-emitted, and work from the previous revision is
+discarded before it reaches the user.
+
+The base package includes the quantized CPU runtime and enables Smart Turn by default:
+
+```bash
+pip install speech-to-speech
+speech-to-speech
+```
+
+The latest supported v3.2 CPU checkpoint downloads from the Hugging Face Hub on first use. Pass
+`--smart_turn_model_path /path/to/model.onnx` to use a local model, or `--no_smart_turn` to disable Smart Turn.
+Smart Turn is supported only with `--mode realtime`; pass `--no_smart_turn` when selecting another mode.
+
+Tune the completion cutoff with `--smart_turn_threshold` (default `0.5`). A higher threshold makes ambiguous
+pauses more likely to use the longer speculative response grace.
 
 ### STT, LLM, and TTS Parameters
 

@@ -109,6 +109,16 @@ class ParsedArguments:
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments
 
 
+def validate_smart_turn_mode(
+    module_kwargs: ModuleArguments,
+    vad_handler_kwargs: VADHandlerArguments,
+) -> None:
+    if vad_handler_kwargs.smart_turn and module_kwargs.mode != "realtime":
+        raise ValueError(
+            "--smart_turn is only supported with --mode realtime; pass --no_smart_turn when using another mode"
+        )
+
+
 def rename_args(args: Any, prefix: str) -> None:
     """
     Rename arguments by removing the prefix and prepares the gen_kwargs.
@@ -124,6 +134,34 @@ def rename_args(args: Any, prefix: str) -> None:
                 args.__dict__[new_key] = value
 
     args.__dict__["gen_kwargs"] = gen_kwargs
+
+
+def build_llm_proxy_config(
+    module_kwargs: ModuleArguments,
+    responses_api_language_model_handler_kwargs: ResponsesApiLanguageModelHandlerArguments,
+) -> Any:
+    """Proxy upstream settings, read from the same fields the pipeline LM uses.
+
+    Both remote backends read their connection settings from the responses-api
+    argument class (see get_llm_handler), so the proxy reuses the upstream URL,
+    key, and model the pipeline LM runs with. Must be called after
+    prepare_all_args(): rename_args() has popped the raw ``responses_api_*``
+    fields into their handler names (``base_url``, ``api_key``), and reading
+    the raw names after that silently returns the dataclass class defaults
+    (None) — which pointed the proxy at the OpenAI default upstream with no
+    key, whatever the flags said. Indexing vars() keeps that failure loud.
+    """
+    from speech_to_speech.api.openai_realtime.llm_proxy import LLMProxyConfig
+
+    lm_vars = vars(responses_api_language_model_handler_kwargs)
+    return LLMProxyConfig(
+        enabled=module_kwargs.enable_llm_proxy,
+        llm_backend=module_kwargs.llm_backend,
+        upstream_base_url=lm_vars["base_url"],
+        upstream_api_key=lm_vars["api_key"],
+        model_name=lm_vars["model_name"],
+        connect_timeout_s=module_kwargs.llm_proxy_connect_timeout_s,
+    )
 
 
 def parse_arguments() -> ParsedArguments:
@@ -177,7 +215,7 @@ def parse_arguments() -> ParsedArguments:
     by_type: dict[type, Any] = {type(obj): obj for obj in parsed}
     logger.debug("Parsed %d argument classes: %s", len(by_type), [t.__name__ for t in by_type])
 
-    return ParsedArguments(
+    args = ParsedArguments(
         module_kwargs=by_type[ModuleArguments],
         socket_receiver_kwargs=by_type[SocketReceiverArguments],
         socket_sender_kwargs=by_type[SocketSenderArguments],
@@ -201,6 +239,8 @@ def parse_arguments() -> ParsedArguments:
         kokoro_tts_handler_kwargs=by_type[KokoroTTSHandlerArguments],
         qwen3_tts_handler_kwargs=by_type[Qwen3TTSHandlerArguments],
     )
+    validate_smart_turn_mode(args.module_kwargs, args.vad_handler_kwargs)
+    return args
 
 
 def setup_logger(log_level: str) -> None:
@@ -281,6 +321,8 @@ def prepare_module_args(module_kwargs: ModuleArguments, *handler_kwargs: Any) ->
     optimal_mac_settings(module_kwargs.local_mac_optimal_settings, module_kwargs, *handler_kwargs)
     if module_kwargs.tts is None:
         module_kwargs.tts = "qwen3"
+    if module_kwargs.stt == "none" and module_kwargs.llm_backend != "chat-completions":
+        raise ValueError("--stt none requires --llm_backend chat-completions for audio-input LLM requests.")
     if platform == "darwin":
         check_mac_settings(module_kwargs)
     overwrite_device_argument(module_kwargs.device, *handler_kwargs)
@@ -377,7 +419,7 @@ def _build_pipeline_handlers(
     qwen3_tts_handler_kwargs: Qwen3TTSHandlerArguments,
     speculative_turns: SpeculativeTurnTracker | None = None,
 ) -> list[Any]:
-    """Build the shared handler chain: VAD → STT → TranscriptionNotifier → LM → LMOutputProcessor → TTS.
+    """Build the shared handler chain: VAD → STT/AudioInput → LM → LMOutputProcessor → TTS.
 
     Callers own the queues, events, and any per-mode mutations to handler kwargs (cancel_scope,
     text_output_queue, live transcription flags). `transcription_notifier_setup` differs by mode:
@@ -393,25 +435,45 @@ def _build_pipeline_handlers(
         setup_kwargs=vars(vad_handler_kwargs),
     )
 
-    transcription_notifier = TranscriptionNotifier(
-        stop_event,
-        queue_in=stt_output_queue,
-        queue_out=text_prompt_queue,  # type: ignore[arg-type]
-        setup_kwargs=transcription_notifier_setup,
-    )
+    speech_input_handlers: list[Any]
+    if module_kwargs.stt == "none":
+        from speech_to_speech.LLM.audio_input_notifier import AudioInputNotifier
 
-    stt = get_stt_handler(
-        module_kwargs,
-        stop_event,
-        spoken_prompt_queue,
-        stt_output_queue,
-        speculative_turns,
-        whisper_stt_handler_kwargs,
-        faster_whisper_stt_handler_kwargs,
-        paraformer_stt_handler_kwargs,
-        mlx_audio_whisper_stt_handler_kwargs,
-        parakeet_tdt_stt_handler_kwargs,
-    )
+        speech_input_handlers = [
+            AudioInputNotifier(
+                stop_event,
+                queue_in=spoken_prompt_queue,
+                queue_out=text_prompt_queue,
+                setup_kwargs={
+                    "runtime_config": transcription_notifier_setup.get("runtime_config"),
+                    "should_listen": should_listen,
+                    "sample_rate": vad_handler_kwargs.sample_rate,
+                    "speculative_turns": speculative_turns,
+                    "text_output_queue": text_output_queue,
+                },
+            )
+        ]
+    else:
+        transcription_notifier = TranscriptionNotifier(
+            stop_event,
+            queue_in=stt_output_queue,
+            queue_out=text_prompt_queue,  # type: ignore[arg-type]
+            setup_kwargs=transcription_notifier_setup,
+        )
+
+        stt = get_stt_handler(
+            module_kwargs,
+            stop_event,
+            spoken_prompt_queue,
+            stt_output_queue,
+            speculative_turns,
+            whisper_stt_handler_kwargs,
+            faster_whisper_stt_handler_kwargs,
+            paraformer_stt_handler_kwargs,
+            mlx_audio_whisper_stt_handler_kwargs,
+            parakeet_tdt_stt_handler_kwargs,
+        )
+        speech_input_handlers = [stt, transcription_notifier]
 
     lm = get_llm_handler(
         module_kwargs,
@@ -442,7 +504,7 @@ def _build_pipeline_handlers(
         qwen3_tts_handler_kwargs,
     )
 
-    return [vad, stt, transcription_notifier, lm, lm_processor, tts]
+    return [vad, *speech_input_handlers, lm, lm_processor, tts]
 
 
 def _build_realtime_pipeline_unit(
@@ -609,7 +671,7 @@ def build_pipeline(
     lm_response_queue = queues_and_events["lm_response_queue"]
     lm_processed_queue = queues_and_events["lm_processed_queue"]
     text_output_queue = (
-        None  # Only set for websocket/realtime modes; kept None otherwise to avoid unbounded queue growth
+        None  # Only set for raw WebSocket and Realtime modes; kept None otherwise to avoid unbounded queue growth
     )
 
     comms_handlers: list[Any] = []
@@ -623,7 +685,7 @@ def build_pipeline(
         )
         comms_handlers = [local_audio_streamer]
         should_listen.set()
-    elif module_kwargs.mode == "websocket":
+    elif module_kwargs.mode == "raw-websocket":
         from speech_to_speech.connections.websocket_streamer import WebSocketStreamer
 
         text_output_queue = queues_and_events["text_output_queue"]
@@ -663,11 +725,14 @@ def build_pipeline(
             for i in range(pool_size)
         ]
 
+        llm_proxy_config = build_llm_proxy_config(module_kwargs, responses_api_language_model_handler_kwargs)
+
         realtime_server = RealtimeServer(
             stop_event=stop_event,
             pool=pool,
             host=websocket_streamer_kwargs.ws_host,
             port=websocket_streamer_kwargs.ws_port,
+            llm_proxy_config=llm_proxy_config,
         )
 
         all_handlers: list[Any] = [realtime_server]
@@ -844,7 +909,7 @@ def get_stt_handler(
         )
     else:
         raise ValueError(
-            "The STT should be either whisper, whisper-mlx, mlx-audio-whisper, faster-whisper, parakeet-tdt, or paraformer."
+            "The STT should be either none, whisper, whisper-mlx, mlx-audio-whisper, faster-whisper, parakeet-tdt, or paraformer."
         )
 
 
@@ -1005,6 +1070,7 @@ def main() -> None:
         args.kokoro_tts_handler_kwargs,
         args.qwen3_tts_handler_kwargs,
     )
+    validate_smart_turn_mode(args.module_kwargs, args.vad_handler_kwargs)
 
     # Validate after prepare_all_args(): --local_mac_optimal_settings mutates
     # module_kwargs.mode to "local", so checking before would let
